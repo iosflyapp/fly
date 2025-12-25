@@ -1080,7 +1080,8 @@ struct ExternalKeyboardUITextField: UIViewRepresentable {
     
     func makeUIView(context: Context) -> UITextField {
         let textField = UITextField()
-        textField.delegate = context.coordinator
+        
+        // Configure text field properties first
         textField.font = UIFont.systemFont(ofSize: 17)
         textField.textColor = .label
         textField.text = text
@@ -1091,12 +1092,11 @@ struct ExternalKeyboardUITextField: UIViewRepresentable {
         textField.autocorrectionType = autocorrectionType
         textField.returnKeyType = returnKeyType
         textField.enablesReturnKeyAutomatically = false
-        
-        // Critical for external keyboard support
         textField.keyboardAppearance = .dark
         textField.clearButtonMode = .whileEditing
         
-        // Add target for text changes (works better with external keyboards)
+        // Set delegate and target after configuration
+        textField.delegate = context.coordinator
         textField.addTarget(context.coordinator, action: #selector(Coordinator.textFieldDidChange(_:)), for: .editingChanged)
         
         return textField
@@ -1104,15 +1104,32 @@ struct ExternalKeyboardUITextField: UIViewRepresentable {
     
     func updateUIView(_ textField: UITextField, context: Context) {
         // Only update text if it changed externally and text field is not being edited
-        if !textField.isFirstResponder && textField.text != text {
-            textField.text = text
+        // This prevents conflicts when user is typing
+        if !textField.isFirstResponder {
+            if textField.text != text {
+                textField.text = text
+            }
         }
-        textField.placeholder = placeholder
-        textField.isSecureTextEntry = isSecure
-        textField.keyboardType = keyboardType
-        textField.autocapitalizationType = autocapitalizationType
-        textField.autocorrectionType = autocorrectionType
-        textField.returnKeyType = returnKeyType
+        
+        // Update other properties
+        if textField.placeholder != placeholder {
+            textField.placeholder = placeholder
+        }
+        if textField.isSecureTextEntry != isSecure {
+            textField.isSecureTextEntry = isSecure
+        }
+        if textField.keyboardType != keyboardType {
+            textField.keyboardType = keyboardType
+        }
+        if textField.autocapitalizationType != autocapitalizationType {
+            textField.autocapitalizationType = autocapitalizationType
+        }
+        if textField.autocorrectionType != autocorrectionType {
+            textField.autocorrectionType = autocorrectionType
+        }
+        if textField.returnKeyType != returnKeyType {
+            textField.returnKeyType = returnKeyType
+        }
     }
     
     func makeCoordinator() -> Coordinator {
@@ -1127,9 +1144,10 @@ struct ExternalKeyboardUITextField: UIViewRepresentable {
         }
         
         @objc func textFieldDidChange(_ textField: UITextField) {
-            // Update binding from text field changes
-            DispatchQueue.main.async {
-                self.parent.text = textField.text ?? ""
+            // Update binding - this is called on main thread by UIKit
+            let newText = textField.text ?? ""
+            if parent.text != newText {
+                parent.text = newText
             }
         }
         
@@ -1176,6 +1194,7 @@ struct ExternalKeyboardTextField: UIViewRepresentable {
         wrapper.textView.keyboardAppearance = .dark
         wrapper.placeholder = placeholder
         wrapper.placeholderColor = UIColor.white.withAlphaComponent(0.4)
+        wrapper.textView.text = text
         wrapper.updatePlaceholder()
         
         return wrapper
@@ -1183,9 +1202,15 @@ struct ExternalKeyboardTextField: UIViewRepresentable {
     
     func updateUIView(_ wrapper: UITextViewWrapper, context: Context) {
         context.coordinator.wrapper = wrapper
-        if wrapper.textView.text != text {
+        
+        // Only update text if it changed externally and text view is not being edited
+        if !wrapper.textView.isFirstResponder && wrapper.textView.text != text {
+            context.coordinator.isUpdatingFromBinding = true
             wrapper.textView.text = text
             wrapper.updatePlaceholder()
+            DispatchQueue.main.async {
+                context.coordinator.isUpdatingFromBinding = false
+            }
         }
         
         wrapper.placeholder = placeholder
@@ -1209,14 +1234,27 @@ struct ExternalKeyboardTextField: UIViewRepresentable {
     class Coordinator: NSObject, UITextViewDelegate {
         var parent: ExternalKeyboardTextField
         weak var wrapper: UITextViewWrapper?
+        private var isUpdatingFromBinding = false
         
         init(_ parent: ExternalKeyboardTextField) {
             self.parent = parent
         }
         
         func textViewDidChange(_ textView: UITextView) {
-            parent.text = textView.text
-            wrapper?.updatePlaceholder()
+            guard !isUpdatingFromBinding else { return }
+            let newText = textView.text
+            if parent.text != newText {
+                if Thread.isMainThread {
+                    parent.text = newText
+                    wrapper?.updatePlaceholder()
+                } else {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self else { return }
+                        self.parent.text = newText
+                        self.wrapper?.updatePlaceholder()
+                    }
+                }
+            }
         }
         
         func textView(_ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
@@ -1228,15 +1266,23 @@ struct ExternalKeyboardTextField: UIViewRepresentable {
         }
         
         func textViewDidBeginEditing(_ textView: UITextView) {
-            DispatchQueue.main.async {
-                self.parent.isFocused = true
+            if Thread.isMainThread {
+                parent.isFocused = true
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.parent.isFocused = true
+                }
             }
             wrapper?.updatePlaceholder()
         }
         
         func textViewDidEndEditing(_ textView: UITextView) {
-            DispatchQueue.main.async {
-                self.parent.isFocused = false
+            if Thread.isMainThread {
+                parent.isFocused = false
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.parent.isFocused = false
+                }
             }
             wrapper?.updatePlaceholder()
         }
@@ -1297,10 +1343,18 @@ class UITextViewWrapper: UIView {
     }
     
     @objc private func textDidChange() {
-        updatePlaceholder()
+        DispatchQueue.main.async { [weak self] in
+            self?.updatePlaceholder()
+        }
     }
     
     func updatePlaceholder() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.updatePlaceholder()
+            }
+            return
+        }
         placeholderLabel.isHidden = !textView.text.isEmpty
     }
     

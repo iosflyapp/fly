@@ -1,0 +1,21 @@
+name: ProReader
+options:
+  bundleIdPrefix: neo.uniwalls
+targets:
+  ProReader:
+    type: application
+    platform: iOS
+    deploymentTarget: 17.0
+    sources: [ProReaderApp.swift]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: neo.uniwalls
+        DEVELOPMENT_TEAM: VYB7C529CN
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Development"
+        PROVISIONING_PROFILE_SPECIFIER: "Developer"
+        GENERATE_INFOPLIST_FILE: YES
+        MARKETING_VERSION: 1.0
+        CURRENT_PROJECT_VERSION: 1
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        INFOPLIST_KEY_UILaunchScreen_Generation: true

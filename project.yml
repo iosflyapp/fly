@@ -1,9 +1,9 @@
-name: Compiler
+name: MyApp
 options:
   bundleIdPrefix: neo.uniwalls
   xcodeVersion: "15.0"
 targets:
-  Compiler:
+  MyApp:
     type: application
     platform: iOS
     deploymentTarget: 17.0

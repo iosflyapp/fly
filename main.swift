@@ -44,7 +44,7 @@ struct ContentView: View {
                         count += 1
                         // Change background randomly on every 5th tap
                         if count % 5 == 0 {
-                            bgColor = [Color.blue, Color.purple, Color.red, Color.black].randomElement()!
+                            bgColor = [Color.blue, Color.purple, Color.red, Color.gray].randomElement()!
                         }
                     }) {
                         Text("Tap Me")

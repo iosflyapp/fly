@@ -1,7 +1,7 @@
 import SwiftUI
 import Combine
 
-// MARK: - 1. STORAGE & CONFIG (iCloud Sync)
+// MARK: - 1. STORAGE & CONFIG
 
 class TokenManager: ObservableObject {
     @Published var token: String = ""
@@ -11,30 +11,20 @@ class TokenManager: ObservableObject {
     private let store = NSUbiquitousKeyValueStore.default
     
     init() {
-        // Load from iCloud on startup
         self.token = store.string(forKey: "gh_token") ?? ""
         self.username = store.string(forKey: "gh_user") ?? ""
         self.repo = store.string(forKey: "gh_repo") ?? ""
-        
-        // Listen for changes from other devices
         NotificationCenter.default.addObserver(self, selector: #selector(didChange), name: NSUbiquitousKeyValueStore.didChangeExternallyNotification, object: store)
         store.synchronize()
     }
     
     func save(token: String, user: String, repo: String) {
-        self.token = token
-        self.username = user
-        self.repo = repo
-        
-        store.set(token, forKey: "gh_token")
-        store.set(user, forKey: "gh_user")
-        store.set(repo, forKey: "gh_repo")
+        self.token = token; self.username = user; self.repo = repo
+        store.set(token, forKey: "gh_token"); store.set(user, forKey: "gh_user"); store.set(repo, forKey: "gh_repo")
         store.synchronize()
     }
     
-    func logout() {
-        save(token: "", user: "", repo: "")
-    }
+    func logout() { save(token: "", user: "", repo: "") }
     
     @objc func didChange() {
         DispatchQueue.main.async {
@@ -43,11 +33,10 @@ class TokenManager: ObservableObject {
             self.repo = self.store.string(forKey: "gh_repo") ?? ""
         }
     }
-    
     var isLoggedIn: Bool { !token.isEmpty && !username.isEmpty && !repo.isEmpty }
 }
 
-// MARK: - 2. GITHUB CLIENT (The Engine)
+// MARK: - 2. BUILD ENGINE
 
 @MainActor
 class BuildEngine: ObservableObject {
@@ -57,62 +46,44 @@ class BuildEngine: ObservableObject {
     @Published var artifactURL: URL?
     @Published var errorMsg: String?
     
+    struct GitHubConfig { let owner, repo, token: String }
+    
     func compile(appName: String, code: String, manager: TokenManager) async {
         guard !manager.token.isEmpty else { return }
         
-        withAnimation {
-            isBuilding = true
-            progress = 0.1
-            status = "Initializing..."
-            errorMsg = nil
-            artifactURL = nil
-        }
+        withAnimation { isBuilding = true; progress = 0.1; status = "Initializing..."; errorMsg = nil; artifactURL = nil }
         
         let config = GitHubConfig(owner: manager.username, repo: manager.repo, token: manager.token)
         
         do {
-            // 1. Upload Project Spec
-            status = "Configuring Project..."
-            progress = 0.2
-            let projectYml = makeProjectYml(appName: appName)
-            try await uploadFile(content: projectYml, path: "project.yml", config: config)
-            
-            // 2. Upload Source Code
+            // 1. Upload Project & Code
             status = "Uploading Code..."
-            progress = 0.4
+            progress = 0.3
+            try await uploadFile(content: makeProjectYml(appName: appName), path: "project.yml", config: config)
             try await uploadFile(content: code, path: "SourceCode.swift", config: config)
             
-            // 3. Trigger Build
+            // 2. Trigger Build
             status = "Queuing Build..."
             progress = 0.5
             try await triggerWorkflow(config: config)
             
-            // 4. Wait for Result
+            // 3. Monitor
             status = "Compiling in Cloud..."
             let runId = try await monitorBuild(config: config)
             
-            // 5. Download
-            status = "Downloading IPA..."
+            // 4. Download Direct IPA from Release
+            status = "Fetching IPA..."
             progress = 0.9
-            try await downloadArtifact(runId: runId, config: config)
+            try await downloadDirectIPA(runId: runId, config: config)
             
-            withAnimation {
-                status = "Success!"
-                progress = 1.0
-                isBuilding = false
-            }
+            withAnimation { status = "Success!"; progress = 1.0; isBuilding = false }
             
         } catch {
-            withAnimation {
-                isBuilding = false
-                progress = 0.0
-                status = "Failed"
-                errorMsg = error.localizedDescription
-            }
+            withAnimation { isBuilding = false; progress = 0.0; status = "Failed"; errorMsg = error.localizedDescription }
         }
     }
     
-    // --- API Helpers ---
+    // --- API Logic ---
     
     private func makeProjectYml(appName: String) -> String {
         return """
@@ -140,13 +111,10 @@ class BuildEngine: ObservableObject {
         """
     }
     
-    struct GitHubConfig { let owner, repo, token: String }
-    
     private func uploadFile(content: String, path: String, config: GitHubConfig) async throws {
         let url = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/contents/\(path)")!
         var getReq = request(url: url, token: config.token, method: "GET")
         let (data, resp) = try await URLSession.shared.data(for: getReq)
-        
         var sha = ""
         if (resp as? HTTPURLResponse)?.statusCode == 200 {
             struct FileInfo: Decodable { var sha: String }
@@ -154,18 +122,10 @@ class BuildEngine: ObservableObject {
         }
         
         var putReq = request(url: url, token: config.token, method: "PUT")
-        let body: [String: Any] = [
-            "message": "Update \(path)",
-            "content": Data(content.utf8).base64EncodedString(),
-            "sha": sha,
-            "branch": "main"
-        ]
+        let body: [String: Any] = ["message": "Update \(path)", "content": Data(content.utf8).base64EncodedString(), "sha": sha, "branch": "main"]
         putReq.httpBody = try? JSONSerialization.data(withJSONObject: body)
         let (_, putResp) = try await URLSession.shared.data(for: putReq)
-        
-        guard (putResp as? HTTPURLResponse)?.statusCode ?? 0 < 300 else {
-            throw NSError(domain: "Upload Failed", code: 1, userInfo: [NSLocalizedDescriptionKey: "Check write permissions on token."])
-        }
+        if (putResp as? HTTPURLResponse)?.statusCode ?? 0 >= 300 { throw NSError(domain: "Upload", code: 1, userInfo: [NSLocalizedDescriptionKey: "Upload failed."]) }
     }
     
     private func triggerWorkflow(config: GitHubConfig) async throws {
@@ -173,48 +133,73 @@ class BuildEngine: ObservableObject {
         var req = request(url: url, token: config.token, method: "POST")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["ref": "main"])
         let (_, resp) = try await URLSession.shared.data(for: req)
-        guard (resp as? HTTPURLResponse)?.statusCode == 204 else {
-            throw NSError(domain: "Trigger Failed", code: 2, userInfo: [NSLocalizedDescriptionKey: "Could not start build. Check workflow filename."])
-        }
+        if (resp as? HTTPURLResponse)?.statusCode != 204 { throw NSError(domain: "Trigger", code: 2, userInfo: [NSLocalizedDescriptionKey: "Trigger failed."]) }
         try await Task.sleep(nanoseconds: 5 * 1_000_000_000)
     }
     
     private func monitorBuild(config: GitHubConfig) async throws -> Int {
         let url = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/actions/runs?per_page=1")!
         var attempts = 0
-        while attempts < 40 { // ~3 mins max
+        while attempts < 40 {
             attempts += 1
             if attempts > 1 { try await Task.sleep(nanoseconds: 5 * 1_000_000_000) }
-            
             let (data, _) = try await URLSession.shared.data(for: request(url: url, token: config.token, method: "GET"))
             struct Runs: Decodable { var workflow_runs: [Run] }
             struct Run: Decodable { var id: Int; var status: String; var conclusion: String? }
-            
             if let run = try? JSONDecoder().decode(Runs.self, from: data).workflow_runs.first {
                 if run.status == "completed" {
                     if run.conclusion == "success" { return run.id }
-                    throw NSError(domain: "Build Failed", code: 3, userInfo: [NSLocalizedDescriptionKey: "GitHub Action failed. Check server logs."])
+                    throw NSError(domain: "Build", code: 3, userInfo: [NSLocalizedDescriptionKey: "Build failed on server."])
                 }
             }
         }
-        throw NSError(domain: "Timeout", code: 4, userInfo: [NSLocalizedDescriptionKey: "Build took too long."])
+        throw NSError(domain: "Timeout", code: 4, userInfo: [NSLocalizedDescriptionKey: "Build timed out."])
     }
     
-    private func downloadArtifact(runId: Int, config: GitHubConfig) async throws {
-        let url = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/actions/runs/\(runId)/artifacts")!
-        let (data, _) = try await URLSession.shared.data(for: request(url: url, token: config.token, method: "GET"))
+    // NEW: Download IPA from Release, then Delete Release
+    private func downloadDirectIPA(runId: Int, config: GitHubConfig) async throws {
+        let tagName = "build-\(runId)"
+        let releaseUrl = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/releases/tags/\(tagName)")!
         
-        struct ArtList: Decodable { var artifacts: [Artifact] }
-        struct Artifact: Decodable { var archive_download_url: String }
-        
-        guard let dlUrlStr = (try? JSONDecoder().decode(ArtList.self, from: data))?.artifacts.first?.archive_download_url,
-              let dlUrl = URL(string: dlUrlStr) else { return }
-        
-        let (tempUrl, _) = try await URLSession.shared.download(for: request(url: dlUrl, token: config.token, method: "GET"))
-        let destUrl = FileManager.default.temporaryDirectory.appendingPathComponent("\(runId).zip")
-        try? FileManager.default.removeItem(at: destUrl)
-        try FileManager.default.moveItem(at: tempUrl, to: destUrl)
-        self.artifactURL = destUrl
+        // 1. Get Release Info
+        var attempts = 0
+        while attempts < 10 { // Wait for release to appear
+            attempts += 1
+            let (data, resp) = try await URLSession.shared.data(for: request(url: releaseUrl, token: config.token, method: "GET"))
+            
+            if (resp as? HTTPURLResponse)?.statusCode == 200 {
+                struct Release: Decodable { var id: Int; var assets: [Asset] }
+                struct Asset: Decodable { var name: String; var url: String } 
+                
+                if let release = try? JSONDecoder().decode(Release.self, from: data),
+                   let asset = release.assets.first(where: { $0.name.hasSuffix(".ipa") }) {
+                    
+                    // 2. Download Asset (Raw)
+                    var dlReq = request(url: URL(string: asset.url)!, token: config.token, method: "GET")
+                    dlReq.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+                    
+                    let (tempUrl, _) = try await URLSession.shared.download(for: dlReq)
+                    let destUrl = FileManager.default.temporaryDirectory.appendingPathComponent(asset.name)
+                    try? FileManager.default.removeItem(at: destUrl)
+                    try FileManager.default.moveItem(at: tempUrl, to: destUrl)
+                    self.artifactURL = destUrl
+                    
+                    // 3. Cleanup: Delete Release
+                    let delUrl = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/releases/\(release.id)")!
+                    var delReq = request(url: delUrl, token: config.token, method: "DELETE")
+                    _ = try? await URLSession.shared.data(for: delReq)
+                    
+                    // Also delete tag ref
+                    let tagUrl = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/git/refs/tags/\(tagName)")!
+                    var tagReq = request(url: tagUrl, token: config.token, method: "DELETE")
+                    _ = try? await URLSession.shared.data(for: tagReq)
+                    
+                    return
+                }
+            }
+            try await Task.sleep(nanoseconds: 2 * 1_000_000_000)
+        }
+        throw NSError(domain: "Download", code: 5, userInfo: [NSLocalizedDescriptionKey: "IPA not found in release."])
     }
     
     private func request(url: URL, token: String, method: String) -> URLRequest {
@@ -227,263 +212,107 @@ class BuildEngine: ObservableObject {
     }
 }
 
-// MARK: - 3. USER INTERFACE (Modern Design)
+// MARK: - 3. UI
 
 @main
 struct CompilerApp: App {
     @StateObject var tokenManager = TokenManager()
-    
     var body: some Scene {
         WindowGroup {
-            if tokenManager.isLoggedIn {
-                DashboardView().environmentObject(tokenManager)
-            } else {
-                LoginView().environmentObject(tokenManager)
-            }
+            if tokenManager.isLoggedIn { DashboardView().environmentObject(tokenManager) }
+            else { LoginView().environmentObject(tokenManager) }
         }
     }
 }
 
 struct LoginView: View {
     @EnvironmentObject var manager: TokenManager
-    @State private var token = ""
-    @State private var user = ""
-    @State private var repo = ""
+    // FIXED: Split multiple state variables to separate lines
+    @State private var t = ""
+    @State private var u = ""
+    @State private var r = ""
     
     var body: some View {
         ZStack {
             MeshGradientBackground().ignoresSafeArea()
-            
-            VStack(spacing: 25) {
-                Image(systemName: "cpu.fill")
-                    .font(.system(size: 80))
-                    .foregroundStyle(.white)
-                    .shadow(radius: 10)
+            VStack(spacing: 20) {
+                Image(systemName: "cpu.fill").font(.system(size: 80)).foregroundColor(.white).shadow(radius: 10)
                 
-                Text("Compiler")
-                    .font(.system(size: 40, weight: .bold, design: .rounded))
+                // FIXED: Correct Font syntax for rounded design
+                Text("Compiler 3.0")
+                    .font(.system(.largeTitle, design: .rounded).bold())
                     .foregroundColor(.white)
                 
                 VStack(spacing: 15) {
-                    CustomTextField(icon: "person.fill", placeholder: "GitHub Username", text: $user)
-                    CustomTextField(icon: "folder.fill", placeholder: "Repository Name", text: $repo)
-                    CustomTextField(icon: "key.fill", placeholder: "Personal Access Token", text: $token, isSecure: true)
-                }
-                .padding()
-                .background(.ultraThinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 20))
-                .padding(.horizontal)
+                    CustomTextField(icon: "person.fill", placeholder: "GitHub User", text: $u)
+                    CustomTextField(icon: "folder.fill", placeholder: "Repo Name", text: $r)
+                    CustomTextField(icon: "key.fill", placeholder: "Token (ghp_...)", text: $t, isSecure: true)
+                }.padding().background(.ultraThinMaterial).cornerRadius(20).padding()
                 
-                Button(action: {
-                    withAnimation { manager.save(token: token, user: user, repo: repo) }
-                }) {
-                    Text("Sign In with iCloud")
-                        .font(.headline)
-                        .foregroundColor(.black)
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(Color.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 15))
-                        .shadow(radius: 5)
-                }
-                .padding(.horizontal)
-                .disabled(token.isEmpty || user.isEmpty || repo.isEmpty)
-                .opacity((token.isEmpty || user.isEmpty || repo.isEmpty) ? 0.6 : 1)
-            }
-            .frame(maxWidth: 500)
-        }
-        .preferredColorScheme(.dark)
+                Button(action: { withAnimation { manager.save(token: t, user: u, repo: r) } }) {
+                    Text("Sign In").MainButtonStyle(color: .white).foregroundColor(.black)
+                }.padding().disabled(t.isEmpty||u.isEmpty||r.isEmpty).opacity(0.8)
+            }.frame(maxWidth: 500)
+        }.preferredColorScheme(.dark)
     }
 }
 
 struct DashboardView: View {
     @EnvironmentObject var manager: TokenManager
     @StateObject var engine = BuildEngine()
-    
     @State private var appName = "MyApp"
-    @State private var code = """
-    import SwiftUI
-    
-    @main
-    struct MyApp: App {
-        var body: some Scene {
-            WindowGroup {
-                Text("Hello World")
-                    .font(.largeTitle)
-            }
-        }
-    }
-    """
+    @State private var code = "// Paste Code Here"
     
     var body: some View {
         NavigationStack {
             ZStack {
                 Color(red: 0.05, green: 0.05, blue: 0.07).ignoresSafeArea()
-                
                 VStack(spacing: 0) {
-                    // Header
                     HStack {
-                        VStack(alignment: .leading) {
-                            Text("Dashboard").font(.largeTitle.bold())
-                            Text(manager.username + "/" + manager.repo).font(.caption).foregroundColor(.gray)
-                        }
+                        VStack(alignment: .leading) { Text("Dashboard").font(.largeTitle.bold()); Text("\(manager.username)/\(manager.repo)").font(.caption).foregroundColor(.gray) }
                         Spacer()
-                        Button(action: { withAnimation { manager.logout() } }) {
-                            Image(systemName: "rectangle.portrait.and.arrow.right")
-                                .foregroundColor(.red)
-                                .padding(10)
-                                .background(Color.red.opacity(0.1))
-                                .clipShape(Circle())
-                        }
-                    }
-                    .padding()
+                        Button(action: { manager.logout() }) { Image(systemName: "rectangle.portrait.and.arrow.right").foregroundColor(.red).padding(10).background(Color.red.opacity(0.1)).clipShape(Circle()) }
+                    }.padding()
                     
-                    // App Name Input
-                    HStack {
-                        Image(systemName: "app.dashed")
-                        TextField("App Name", text: $appName)
-                    }
-                    .padding()
-                    .background(Color(white: 0.1))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .padding(.horizontal)
+                    HStack { Image(systemName: "app.dashed"); TextField("App Name", text: $appName) }.padding().background(Color(white: 0.1)).cornerRadius(12).padding(.horizontal)
                     
-                    // Code Editor Area
                     ZStack(alignment: .topTrailing) {
-                        TextEditor(text: $code)
-                            .font(.custom("Menlo", size: 14))
-                            .scrollContentBackground(.hidden)
-                            .background(Color(white: 0.08))
-                            .foregroundColor(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .padding()
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
-                                    .padding()
-                            )
-                        
-                        Button("Paste") {
-                            if let str = UIPasteboard.general.string { code = str }
-                        }
-                        .font(.caption.bold())
-                        .padding(8)
-                        .background(.ultraThinMaterial)
-                        .clipShape(Capsule())
-                        .padding(24)
+                        TextEditor(text: $code).font(.custom("Menlo", size: 12)).scrollContentBackground(.hidden).background(Color(white: 0.08)).cornerRadius(12).padding().overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.1), lineWidth: 1).padding())
+                        Button("Paste") { if let s = UIPasteboard.general.string { code = s } }.font(.caption.bold()).padding(8).background(.ultraThinMaterial).clipShape(Capsule()).padding(24)
                     }
                     
-                    // Build Action Area
                     VStack(spacing: 12) {
                         if engine.isBuilding {
-                            VStack {
-                                ProgressView(value: engine.progress)
-                                    .tint(.blue)
-                                Text(engine.status)
-                                    .font(.caption)
-                                    .foregroundColor(.gray)
-                            }
-                            .padding()
-                        } else if let error = engine.errorMsg {
-                            Text("Error: \(error)")
-                                .font(.caption)
-                                .foregroundColor(.red)
-                                .multilineTextAlignment(.center)
-                                .padding(.bottom, 5)
-                            
-                            Button(action: runBuild) {
-                                Label("Retry", systemImage: "arrow.clockwise")
-                                    .MainButtonStyle(color: .red)
-                            }
+                            ProgressView(value: engine.progress).tint(.blue).padding(.horizontal)
+                            Text(engine.status).font(.caption).foregroundColor(.gray)
+                        } else if let err = engine.errorMsg {
+                            Text("Error: \(err)").font(.caption).foregroundColor(.red).multilineTextAlignment(.center)
+                            Button(action: run) { Label("Retry", systemImage: "arrow.clockwise").MainButtonStyle(color: .red) }
                         } else if let url = engine.artifactURL {
-                            Text("Build Successful!")
-                                .font(.caption)
-                                .foregroundColor(.green)
-                            
-                            ShareLink(item: url) {
-                                Label("Save IPA", systemImage: "square.and.arrow.down")
-                                    .MainButtonStyle(color: .green)
-                            }
-                            
-                            Button("New Build") {
-                                withAnimation { engine.artifactURL = nil }
-                            }
-                            .font(.caption)
-                            .foregroundColor(.gray)
+                            Text("Ready: \(url.lastPathComponent)").font(.caption).foregroundColor(.green)
+                            ShareLink(item: url) { Label("Save IPA", systemImage: "square.and.arrow.down").MainButtonStyle(color: .green) }
+                            Button("New Build") { withAnimation { engine.artifactURL = nil } }.font(.caption).foregroundColor(.gray)
                         } else {
-                            Button(action: runBuild) {
-                                Label("Compile App", systemImage: "hammer.fill")
-                                    .MainButtonStyle(color: .blue)
-                            }
+                            Button(action: run) { Label("Compile App", systemImage: "hammer.fill").MainButtonStyle(color: .blue) }
                         }
-                    }
-                    .padding()
-                    .background(Color(white: 0.05))
+                    }.padding().background(Color(white: 0.05))
                 }
-            }
-            .navigationBarHidden(true)
-        }
-        .preferredColorScheme(.dark)
+            }.navigationBarHidden(true)
+        }.preferredColorScheme(.dark)
     }
-    
-    func runBuild() {
-        Task {
-            await engine.compile(appName: appName, code: code, manager: manager)
-        }
-    }
+    func run() { Task { await engine.compile(appName: appName, code: code, manager: manager) } }
 }
-
-// MARK: - 4. HELPERS & STYLES
 
 struct CustomTextField: View {
-    let icon: String
-    let placeholder: String
-    @Binding var text: String
-    var isSecure: Bool = false
-    
+    let icon: String, placeholder: String; @Binding var text: String; var isSecure=false
     var body: some View {
-        HStack {
-            Image(systemName: icon).foregroundColor(.gray).frame(width: 20)
-            if isSecure {
-                SecureField(placeholder, text: $text)
-            } else {
-                TextField(placeholder, text: $text)
-            }
-        }
-        .padding()
-        .background(Color.black.opacity(0.4))
-        .cornerRadius(12)
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.1)))
+        HStack { Image(systemName: icon).foregroundColor(.gray).frame(width: 20); if isSecure { SecureField(placeholder, text: $text) } else { TextField(placeholder, text: $text) } }
+            .padding().background(Color.black.opacity(0.4)).cornerRadius(12).overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.1)))
     }
 }
-
-// FIXED: Defined globally so CompilerApp doesn't scope it
 struct MainButtonStyleModifier: ViewModifier {
     let color: Color
-    func body(content: Content) -> some View {
-        content
-            .font(.headline)
-            .foregroundColor(.white)
-            .frame(maxWidth: .infinity)
-            .padding()
-            .background(color)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .shadow(color: color.opacity(0.4), radius: 8, y: 4)
-    }
+    func body(content: Content) -> some View { content.font(.headline).foregroundColor(.white).frame(maxWidth: .infinity).padding().background(color).clipShape(RoundedRectangle(cornerRadius: 12)).shadow(color: color.opacity(0.4), radius: 8, y: 4) }
 }
-
-extension View {
-    func MainButtonStyle(color: Color) -> some View {
-        modifier(MainButtonStyleModifier(color: color))
-    }
-}
-
-struct MeshGradientBackground: View {
-    var body: some View {
-        ZStack {
-            Color.black
-            LinearGradient(colors: [.blue.opacity(0.4), .purple.opacity(0.4)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            RadialGradient(colors: [.indigo.opacity(0.3), .clear], center: .center, startRadius: 50, endRadius: 300)
-        }
-    }
-}
+extension View { func MainButtonStyle(color: Color) -> some View { modifier(MainButtonStyleModifier(color: color)) } }
+struct MeshGradientBackground: View { var body: some View { ZStack { Color.black; LinearGradient(colors: [.blue.opacity(0.4), .purple.opacity(0.4)], startPoint: .topLeading, endPoint: .bottomTrailing) } } }

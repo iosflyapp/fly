@@ -1,664 +1,252 @@
 import SwiftUI
-import UIKit
-import AVFoundation
-import PDFKit
-import WebKit
 import Combine
 
-// MARK: - 1. FREE AI ENGINE (Pollinations.ai)
-// Features: Ad-Blocking, Auto-Save History, Swift 6 Concurrency.
+// MARK: - CONFIGURATION
 
-struct ChatMessage: Identifiable, Equatable, Codable {
-    var id = UUID()
-    let isUser: Bool
-    let text: String
-    let date: Date
+struct GitHubConfig: Codable {
+    var owner: String = "iosflyapp"     // Your GitHub Username
+    var repo: String = "fly"            // Your Repository Name
+    var token: String = ""              // Your Personal Access Token
+    var branch: String = "main"
+    var workflowId: String = "ios-build.yml"
+    
+    // Fixed paths to ensure clean overwrites
+    var codePath: String = "SourceCode.swift"
+    var projectPath: String = "project.yml"
 }
 
-struct ChatSession: Identifiable, Equatable, Codable {
-    var id = UUID()
-    var date: Date
-    var title: String
-    var messages: [ChatMessage]
-}
+// MARK: - GITHUB API CLIENT
 
 @MainActor
-class FreeAIClient: ObservableObject {
-    @Published var sessions: [ChatSession] = []
-    @Published var currentSessionId: UUID?
-    @Published var isLoading = false
+class GitHubClient: ObservableObject {
+    @Published var statusMessage = "Ready"
+    @Published var isBusy = false
+    @Published var downloadedURL: URL?
     
-    private let saveKey = "saved_chat_sessions_v7_final"
-    
-    init() {
-        loadHistory()
-        if sessions.isEmpty {
-            createNewSession()
-        } else if currentSessionId == nil {
-            currentSessionId = sessions.first?.id
-        }
+    enum APIError: Error {
+        case invalidURL
+        case requestFailed(reason: String)
+        case noArtifacts
     }
     
-    var currentSession: ChatSession? {
-        get { sessions.first(where: { $0.id == currentSessionId }) }
-        set {
-            if let index = sessions.firstIndex(where: { $0.id == currentSessionId }), let newValue = newValue {
-                sessions[index] = newValue
-            }
-        }
-    }
-    
-    func createNewSession() {
-        let newSession = ChatSession(date: Date(), title: "New Chat", messages: [])
-        withAnimation {
-            sessions.insert(newSession, at: 0)
-            currentSessionId = newSession.id
-        }
-        saveHistory()
-    }
-    
-    func switchSession(to id: UUID) {
-        currentSessionId = id
-    }
-    
-    func deleteSession(at offsets: IndexSet) {
-        withAnimation {
-            sessions.remove(atOffsets: offsets)
-            if sessions.isEmpty { createNewSession() }
-            else if currentSession == nil { currentSessionId = sessions.first?.id }
-        }
-        saveHistory()
-    }
-    
-    func sendMessage(question: String, context: String) {
-        guard var session = currentSession else { return }
+    // GENERIC UPLOADER (Works for Code OR Project file)
+    func uploadFile(content: String, path: String, config: GitHubConfig) async throws {
+        let urlStr = "https://api.github.com/repos/\(config.owner)/\(config.repo)/contents/\(path)"
+        guard let url = URL(string: urlStr) else { throw APIError.invalidURL }
         
-        if session.messages.isEmpty { session.title = question }
+        // 1. Get SHA (Check if file exists)
+        var request = makeRequest(url: url, token: config.token, method: "GET")
+        let (data, response) = try await URLSession.shared.data(for: request)
         
-        let userMsg = ChatMessage(isUser: true, text: question, date: Date())
-        withAnimation { session.messages.append(userMsg) }
-        
-        if let index = sessions.firstIndex(where: { $0.id == session.id }) { sessions[index] = session }
-        saveHistory()
-        
-        guard !context.isEmpty else {
-            let errorMsg = ChatMessage(isUser: false, text: "Please import some text first.", date: Date())
-            withAnimation {
-                if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
-                    sessions[idx].messages.append(errorMsg)
-                }
-            }
-            return
+        var sha: String = ""
+        if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+            struct FileInfo: Decodable { var sha: String }
+            if let decoded = try? JSONDecoder().decode(FileInfo.self, from: data) { sha = decoded.sha }
         }
         
-        isLoading = true
-        let safeContext = String(context.prefix(6000))
-        let systemPrompt = "You are a helpful assistant. Answer strictly based on the text below.\n\n--- TEXT START ---\n\(safeContext)\n--- TEXT END ---\n\nQuestion: \(question)"
-        
-        guard let url = URL(string: "https://text.pollinations.ai/") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
+        // 2. Upload/Update File
+        var putReq = makeRequest(url: url, token: config.token, method: "PUT")
         let body: [String: Any] = [
-            "messages": [["role": "system", "content": systemPrompt]],
-            "model": "openai"
+            "message": "Update \(path)",
+            "content": Data(content.utf8).base64EncodedString(),
+            "sha": sha,
+            "branch": config.branch
         ]
+        putReq.httpBody = try? JSONSerialization.data(withJSONObject: body)
         
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        
-        Task {
-            do {
-                let (data, _) = try await URLSession.shared.data(for: request)
-                if let rawText = String(data: data, encoding: .utf8) {
-                    let cleanText = self.cleanAds(from: rawText)
-                    
-                    let aiMsg = ChatMessage(isUser: false, text: cleanText, date: Date())
-                    withAnimation {
-                        if let idx = self.sessions.firstIndex(where: { $0.id == session.id }) {
-                            self.sessions[idx].messages.append(aiMsg)
-                        }
-                        self.isLoading = false
-                    }
-                    self.saveHistory()
-                }
-            } catch {
-                let errMsg = ChatMessage(isUser: false, text: "Error: \(error.localizedDescription)", date: Date())
-                if let idx = self.sessions.firstIndex(where: { $0.id == session.id }) {
-                    self.sessions[idx].messages.append(errMsg)
-                }
-                self.isLoading = false
-            }
+        let (putData, putResp) = try await URLSession.shared.data(for: putReq)
+        if let http = putResp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            let err = String(data: putData, encoding: .utf8) ?? "Unknown"
+            throw APIError.requestFailed(reason: "Upload \(path) failed: \(http.statusCode) \(err)")
         }
     }
     
-    private func cleanAds(from text: String) -> String {
-        let triggers = [
-            "**Support Pollinations.AI:**",
-            "Powered by Pollinations.AI",
-            "🌸 **Ad** 🌸",
-            "---"
-        ]
+    // TRIGGER BUILD
+    func triggerBuild(config: GitHubConfig) async throws {
+        statusMessage = "Starting Build..."
+        let url = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/actions/workflows/\(config.workflowId)/dispatches")!
+        var req = makeRequest(url: url, token: config.token, method: "POST")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["ref": config.branch])
         
-        var clean = text
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, http.statusCode != 204 {
+            throw APIError.requestFailed(reason: "Trigger failed: \(http.statusCode)")
+        }
+        try await Task.sleep(nanoseconds: 5 * 1_000_000_000)
+    }
+    
+    // MONITOR & DOWNLOAD
+    func monitorAndDownload(config: GitHubConfig) async throws {
+        let url = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/actions/runs?per_page=1")!
         
-        for trigger in triggers {
-            if let range = clean.range(of: trigger) {
-                let dist = clean.distance(from: range.lowerBound, to: clean.endIndex)
-                if dist < 600 {
-                    clean = String(clean[..<range.lowerBound])
-                }
-            }
-        }
-        return clean.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    
-    private func saveHistory() {
-        if let encoded = try? JSONEncoder().encode(sessions) {
-            UserDefaults.standard.set(encoded, forKey: saveKey)
-        }
-    }
-    
-    private func loadHistory() {
-        if let data = UserDefaults.standard.data(forKey: saveKey),
-           let decoded = try? JSONDecoder().decode([ChatSession].self, from: data) {
-            self.sessions = decoded
-        }
-    }
-    
-    func clearCurrentSession() {
-        if let idx = sessions.firstIndex(where: { $0.id == currentSessionId }) {
-            sessions[idx].messages.removeAll()
-            sessions[idx].title = "New Chat"
-            saveHistory()
-        }
-    }
-}
-
-// MARK: - 2. STREAMING EDGE TTS ENGINE (Swift 6 Fixed)
-
-@MainActor
-class StreamingEdgeTTS: NSObject, ObservableObject, URLSessionWebSocketDelegate {
-    enum State { case stopped, buffering, playing, paused }
-    @Published var state: State = .stopped
-    @Published var errorMessage: String?
-    
-    let voices = [
-        ("Adrian", "en-US-AndrewMultilingualNeural"),
-        ("Serena", "en-US-AvaMultilingualNeural"),
-        ("Julian", "en-US-BrianMultilingualNeural"),
-        ("Sophie", "en-US-EmmaMultilingualNeural"),
-        ("Max", "en-US-GuyNeural"),
-        ("Luna", "en-US-AriaNeural"),
-        ("Alice", "en-GB-SoniaNeural"),
-        ("Charlie", "en-GB-RyanNeural")
-    ]
-    @Published var selectedVoice = "en-US-AndrewMultilingualNeural"
-    
-    private var webSocket: URLSessionWebSocketTask?
-    
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.default
-        return URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue())
-    }()
-    
-    private var player: AVQueuePlayer?
-    private var bufferData = Data()
-    private let chunkThreshold = 64 * 1024
-    
-    private let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "E, d MMM yyyy HH:mm:ss 'GMT'"
-        f.timeZone = TimeZone(abbreviation: "GMT")
-        f.locale = Locale(identifier: "en_US")
-        return f
-    }()
-    
-    override init() {
-        super.init()
-        setupAudioSession()
-    }
-    
-    private func setupAudioSession() {
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
-            try AVAudioSession.sharedInstance().setActive(true)
-        } catch { print("Audio Session Error: \(error)") }
-    }
-    
-    func stop() {
-        webSocket?.cancel(with: .normalClosure, reason: nil)
-        player?.pause()
-        player?.removeAllItems()
-        bufferData.removeAll()
-        withAnimation { self.state = .stopped }
-    }
-    
-    func play(text: String) {
-        stop()
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        withAnimation { self.state = .buffering; self.errorMessage = nil }
-        player = AVQueuePlayer()
-        connectAndSpeak(text: text)
-    }
-    
-    func pauseResume() {
-        guard let player = player else { return }
-        if player.timeControlStatus == .playing { player.pause(); state = .paused }
-        else if player.currentItem != nil { player.play(); state = .playing }
-    }
-    
-    func seek(by seconds: Double) {
-        guard let player = player, let currentItem = player.currentItem else { return }
-        let newTime = CMTimeAdd(currentItem.currentTime(), CMTime(seconds: seconds, preferredTimescale: 600))
-        player.seek(to: newTime)
-    }
-    
-    private func connectAndSpeak(text: String) {
-        let urlString = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-        guard let url = URL(string: urlString) else { return }
-        
-        webSocket = session.webSocketTask(with: url)
-        webSocket?.resume()
-        sendConfig()
-        sendSSML(text: text, voice: self.selectedVoice)
-        listen()
-    }
-    
-    private func listen() {
-        webSocket?.receive { [weak self] result in
-            guard let self = self else { return }
+        var attempts = 0
+        while attempts < 40 {
+            attempts += 1
+            statusMessage = "Building... (\(attempts * 5)s)"
             
-            Task {
-                switch result {
-                case .success(let message):
-                    switch message {
-                    case .string(let text): if text.contains("turn.end") { self.processAudioChunk(force: true) } else { self.listen() }
-                    case .data(let data): self.handleBinaryData(data); self.listen()
-                    @unknown default: break
+            var req = makeRequest(url: url, token: config.token, method: "GET")
+            let (data, _) = try await URLSession.shared.data(for: req)
+            
+            struct RunList: Decodable { var workflow_runs: [Run] }
+            struct Run: Decodable { var id: Int; var status: String; var conclusion: String? }
+            
+            if let list = try? JSONDecoder().decode(RunList.self, from: data), let run = list.workflow_runs.first {
+                if run.status == "completed" {
+                    if run.conclusion == "success" {
+                        try await downloadArtifact(runId: run.id, config: config)
+                        return
+                    } else {
+                        throw APIError.requestFailed(reason: "Build Failed (Check GitHub Logs)")
                     }
-                case .failure(_):
-                    self.errorMessage = "Connection interrupted"
                 }
             }
+            try await Task.sleep(nanoseconds: 5 * 1_000_000_000)
         }
+        throw APIError.requestFailed(reason: "Timeout")
     }
     
-    private func handleBinaryData(_ data: Data) {
-        guard data.count > 2 else { return }
-        let headerLen = (Int(data[0]) << 8) | Int(data[1])
-        if data.count > headerLen + 2 {
-            bufferData.append(data.subdata(in: (headerLen + 2)..<data.count))
-            if bufferData.count >= chunkThreshold { processAudioChunk(force: false) }
-        }
-    }
-    
-    private func processAudioChunk(force: Bool) {
-        guard !bufferData.isEmpty else { return }
-        let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent("chunk_\(UUID().uuidString).mp3")
-        do {
-            try bufferData.write(to: tempFile)
-            bufferData.removeAll()
-            let item = AVPlayerItem(url: tempFile)
-            
-            self.player?.insert(item, after: nil)
-            if self.state == .buffering { self.player?.play(); withAnimation { self.state = .playing } }
-            
-        } catch { print("Write Error: \(error)") }
-    }
-    
-    private func sendConfig() {
-        let msg = buildMessage(path: "speech.config", type: "application/json; charset=utf-8", body: """
-        {"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}
-        """)
-        webSocket?.send(.string(msg)) { _ in }
-    }
-    
-    private func sendSSML(text: String, voice: String) {
-        let escaped = text.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "\"", with: "&quot;").replacingOccurrences(of: "'", with: "&apos;")
-        let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='\(voice)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escaped)</prosody></voice></speak>"
-        webSocket?.send(.string(buildMessage(path: "ssml", type: "application/ssml+xml", body: ssml))) { _ in }
-    }
-    
-    private func buildMessage(path: String, type: String, body: String) -> String {
-        let ts = dateFormatter.string(from: Date())
-        let reqId = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        return "X-Timestamp:\(ts)\r\nContent-Type:\(type)\r\nX-RequestId:\(reqId)\r\nPath:\(path)\r\n\r\n\(body)"
-    }
-    
-    nonisolated func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-    }
-    
-    nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let err = error {
-            Task { @MainActor in
-                self.errorMessage = "Network Error: \(err.localizedDescription)"
-            }
-        }
-    }
-}
-
-// MARK: - 3. CONTENT EXTRACTOR
-
-struct ContentExtractor {
-    static func extractFromPDF(url: URL) -> String {
-        guard let doc = PDFDocument(url: url) else { return "" }
-        var txt = ""
-        for i in 0..<doc.pageCount { if let p = doc.page(at: i)?.string { txt += p + "\n" } }
-        return txt
-    }
-    
-    static func extractFromWeb(url: URL) async -> String {
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            return try await MainActor.run {
-                let opts: [NSAttributedString.DocumentReadingOptionKey: Any] = [
-                    .documentType: NSAttributedString.DocumentType.html,
-                    .characterEncoding: String.Encoding.utf8.rawValue
-                ]
-                let attr = try NSAttributedString(data: data, options: opts, documentAttributes: nil)
-                return attr.string
-            }
-        } catch {
-            return "Failed to parse text: \(error.localizedDescription)"
-        }
-    }
-}
-
-// MARK: - 4. MAIN VIEW & UI
-
-@main
-struct ProReaderApp: App {
-    init() {
-        let appearance = UINavigationBarAppearance()
-        appearance.configureWithOpaqueBackground()
-        appearance.backgroundColor = UIColor(red: 0.08, green: 0.08, blue: 0.1, alpha: 1.0)
-        appearance.titleTextAttributes = [.foregroundColor: UIColor.white]
+    func downloadArtifact(runId: Int, config: GitHubConfig) async throws {
+        statusMessage = "Downloading..."
+        let url = URL(string: "https://api.github.com/repos/\(config.owner)/\(config.repo)/actions/runs/\(runId)/artifacts")!
+        var req = makeRequest(url: url, token: config.token, method: "GET")
+        let (data, _) = try await URLSession.shared.data(for: req)
         
-        UINavigationBar.appearance().standardAppearance = appearance
-        UINavigationBar.appearance().compactAppearance = appearance
-        UINavigationBar.appearance().scrollEdgeAppearance = appearance
+        struct ArtifactList: Decodable { var artifacts: [Artifact] }
+        struct Artifact: Decodable { var id: Int; var archive_download_url: String }
+        
+        guard let list = try? JSONDecoder().decode(ArtifactList.self, from: data),
+              let artifact = list.artifacts.first else { throw APIError.noArtifacts }
+        
+        let dlUrl = URL(string: artifact.archive_download_url)!
+        var dlReq = makeRequest(url: dlUrl, token: config.token, method: "GET")
+        let (temp, _) = try await URLSession.shared.download(for: dlReq)
+        
+        let finalUrl = FileManager.default.temporaryDirectory.appendingPathComponent("\(runId).zip")
+        if FileManager.default.fileExists(atPath: finalUrl.path) { try FileManager.default.removeItem(at: finalUrl) }
+        try FileManager.default.moveItem(at: temp, to: finalUrl)
+        self.downloadedURL = finalUrl
+        statusMessage = "Done!"
+        isBusy = false
     }
     
-    var body: some Scene { WindowGroup { ProReaderView().preferredColorScheme(.dark) } }
-}
-
-struct ProReaderView: View {
-    @StateObject private var tts = StreamingEdgeTTS()
-    @StateObject private var aiClient = FreeAIClient()
-    
-    @State private var textContent: String = "Welcome to Pro Reader.\n\nImport a PDF or Web Article.\nThen tap the AI icon to ask questions about it."
-    @State private var showPDFImporter = false
-    @State private var showWebInput = false
-    @State private var showAIChat = false
-    @State private var webURLString = ""
-    @FocusState private var isTextFocused: Bool
-    
-    let bgColor = Color(red: 0.08, green: 0.08, blue: 0.1)
-    let cardColor = Color(red: 0.12, green: 0.12, blue: 0.14)
-    let accentGradient = LinearGradient(colors: [Color.blue, Color.purple], startPoint: .topLeading, endPoint: .bottomTrailing)
-
-    var body: some View {
-        NavigationStack {
-            ZStack(alignment: .bottom) {
-                bgColor.ignoresSafeArea()
-                
-                VStack(spacing: 20) {
-                    ScrollView {
-                        TextEditor(text: $textContent)
-                            .font(.system(.body, design: .serif))
-                            .lineSpacing(8)
-                            .scrollContentBackground(.hidden)
-                            .foregroundColor(.white.opacity(0.9))
-                            .focused($isTextFocused)
-                            .padding()
-                            .frame(minHeight: 300)
-                    }
-                    .background(cardColor)
-                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-                    .shadow(color: Color.black.opacity(0.2), radius: 10, y: 5)
-                    .padding(.horizontal)
-                    Spacer()
-                }.padding(.top)
-
-                ProPlayerPanel(tts: tts, text: textContent, accentGradient: accentGradient)
-            }
-            .navigationTitle("Pro Reader")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { showAIChat = true } label: {
-                        // MARK: MINIMALIST AI BUTTON
-                        Text("AI")
-                            .font(.system(size: 20, weight: .heavy, design: .rounded))
-                            .foregroundColor(.white.opacity(0.8))
-                    }
-                    Menu {
-                        Button(action: { showWebInput = true }) { Label("Web Article", systemImage: "safari") }
-                        Button(action: { showPDFImporter = true }) { Label("PDF Document", systemImage: "doc.text") }
-                        Button(action: { textContent = UIPasteboard.general.string ?? textContent }) { Label("Paste", systemImage: "doc.on.clipboard") }
-                        Divider()
-                        Button(role: .destructive, action: { textContent = "" }) { Label("Clear Text", systemImage: "trash") }
-                    } label: {
-                        Image(systemName: "ellipsis.circle.fill").font(.title3).foregroundColor(.white.opacity(0.8))
-                    }
-                }
-                ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Done") { isTextFocused = false } }
-            }
-            .sheet(isPresented: $showAIChat) { AIChatView(client: aiClient, contextText: textContent) }
-            .alert("Web URL", isPresented: $showWebInput) {
-                TextField("https://...", text: $webURLString).keyboardType(.URL)
-                Button("Load") {
-                    guard let url = URL(string: webURLString) else { return }
-                    Task {
-                        let extracted = await ContentExtractor.extractFromWeb(url: url)
-                        await MainActor.run { textContent = extracted }
-                    }
-                }
-                Button("Cancel", role: .cancel) { }
-            }
-            .fileImporter(isPresented: $showPDFImporter, allowedContentTypes: [.pdf]) { result in
-                if case .success(let url) = result, url.startAccessingSecurityScopedResource() {
-                    textContent = ContentExtractor.extractFromPDF(url: url)
-                    url.stopAccessingSecurityScopedResource()
-                }
-            }
-        }
+    private func makeRequest(url: URL, token: String, method: String) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("iosflyapp", forHTTPHeaderField: "User-Agent")
+        return req
     }
 }
 
-// MARK: - 5. UI COMPONENTS
+// MARK: - UI
 
-struct ProPlayerPanel: View {
-    @ObservedObject var tts: StreamingEdgeTTS
-    var text: String
-    var accentGradient: LinearGradient
-    
-    var body: some View {
-        VStack(spacing: 16) {
-            Menu {
-                ForEach(tts.voices, id: \.1) { name, id in
-                    Button { tts.selectedVoice = id; if tts.state == .playing { tts.play(text: text) } }
-                    label: { HStack { Text(name); if tts.selectedVoice == id { Image(systemName: "checkmark") } } }
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "waveform.circle.fill").symbolRenderingMode(.hierarchical)
-                    Text(tts.voices.first(where: { $0.1 == tts.selectedVoice })?.0 ?? "Voice").font(.subheadline.weight(.medium))
-                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
-                }
-                .foregroundColor(.white.opacity(0.7)).padding(.horizontal, 12).padding(.vertical, 6).background(Capsule().fill(Color.white.opacity(0.05)))
-            }
-            HStack(spacing: 30) {
-                Button { haptic(); tts.seek(by: -10) } label: { Image(systemName: "gobackward.10").font(.title2) }.disabled(tts.state == .stopped || tts.state == .buffering)
-                Button {
-                    haptic(); if tts.state == .stopped { tts.play(text: text) } else { tts.pauseResume() }
-                } label: {
-                    ZStack {
-                        Circle().fill(accentGradient).frame(width: 64, height: 64).shadow(color: .blue.opacity(0.3), radius: 10, y: 5)
-                        if tts.state == .buffering { ProgressView().tint(.white) }
-                        else { Image(systemName: tts.state == .playing ? "pause.fill" : "play.fill").font(.title.bold()).foregroundColor(.white) }
-                    }
-                }
-                Button { haptic(); tts.seek(by: 10) } label: { Image(systemName: "goforward.10").font(.title2) }.disabled(tts.state == .stopped || tts.state == .buffering)
-            }.foregroundColor(.white)
-        }
-        .padding(.top, 20).padding(.bottom, 10).frame(maxWidth: .infinity)
-        .background(
-            UnevenRoundedRectangle(topLeadingRadius: 30, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 30)
-                .fill(Color(red: 0.14, green: 0.14, blue: 0.16)).ignoresSafeArea().shadow(color: .black.opacity(0.3), radius: 20, y: -5)
-        )
-    }
-    func haptic() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-}
-
-// MARK: - 6. AI CHAT UI
-
-struct AIChatView: View {
-    @ObservedObject var client: FreeAIClient
-    var contextText: String
-    @State private var inputText = ""
-    @State private var showHistory = false
-    @Environment(\.dismiss) var dismiss
+struct ContentView: View {
+    @StateObject private var client = GitHubClient()
+    @State private var config = GitHubConfig()
+    @State private var appName: String = "MyApp"
+    @State private var codeText: String = "// Paste Swift Code Here"
+    @State private var showSettings = true
     
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // MESSAGES LIST
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 16) {
-                            if let session = client.currentSession {
-                                if session.messages.isEmpty {
-                                    VStack(spacing: 20) {
-                                        Image(systemName: "bubble.left.and.bubble.right.fill")
-                                            .font(.system(size: 50))
-                                            .foregroundColor(.gray.opacity(0.5))
-                                        Text("Start a new conversation").font(.headline).foregroundColor(.gray)
-                                    }
-                                    .frame(maxWidth: .infinity).padding(.top, 50)
-                                } else {
-                                    ForEach(session.messages) { msg in ChatBubble(message: msg) }
-                                }
-                            }
-                            if client.isLoading {
-                                HStack { Spacer(); ProgressView(); Spacer() }.padding()
-                            }
-                            Spacer().frame(height: 20)
-                        }
-                        .padding()
-                    }
-                    .onChange(of: client.currentSession?.messages.count) { _, _ in
-                        if let last = client.currentSession?.messages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
-                    }
+                // STATUS BAR
+                HStack {
+                    Circle().fill(client.isBusy ? .yellow : (client.downloadedURL != nil ? .green : .gray)).frame(width: 8, height: 8)
+                    Text(client.statusMessage).font(.caption.monospaced())
+                    Spacer()
                 }
+                .padding().background(Color(uiColor: .systemGroupedBackground))
                 
-                // INPUT AREA
-                HStack(spacing: 10) {
-                    TextField("Ask about the text...", text: $inputText)
-                        .padding(12).background(Color(white: 0.15)).cornerRadius(24).foregroundColor(.white)
-                        .submitLabel(.send).onSubmit { sendMessage() }
+                // CONTROLS
+                HStack {
+                    TextField("App Name", text: $appName)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
                     
-                    Button(action: sendMessage) {
-                        Image(systemName: "arrow.up.circle.fill").font(.system(size: 34)).symbolRenderingMode(.hierarchical).foregroundColor(.blue)
-                    }
-                    .disabled(client.isLoading || inputText.isEmpty)
-                }
-                .padding().background(.regularMaterial)
-            }
-            .navigationTitle(client.currentSession?.title ?? "Ask AI")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
-                ToolbarItem(placement: .primaryAction) {
-                    HStack(spacing: 20) {
-                        Button { client.createNewSession() } label: { Image(systemName: "square.and.pencil") }
-                        Button { showHistory = true } label: { Image(systemName: "clock.arrow.circlepath") }
-                    }
-                }
-            }
-            .sheet(isPresented: $showHistory) { HistoryView(client: client) }
-            .background(Color(red: 0.08, green: 0.08, blue: 0.1).ignoresSafeArea())
-        }
-        .preferredColorScheme(.dark)
-    }
-    
-    func sendMessage() {
-        guard !inputText.isEmpty else { return }
-        let q = inputText; inputText = ""
-        client.sendMessage(question: q, context: contextText)
-    }
-}
-
-// MARK: - 7. HISTORY UI (Redesigned for No Overlap)
-
-struct HistoryView: View {
-    @ObservedObject var client: FreeAIClient
-    @Environment(\.dismiss) var dismiss
-    
-    var body: some View {
-        NavigationStack {
-            List {
-                ForEach(client.sessions) { session in
-                    Button {
-                        client.switchSession(to: session.id)
-                        dismiss()
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(session.title.isEmpty ? "New Chat" : session.title)
-                                    .font(.headline)
-                                    .foregroundColor(.white)
-                                    .lineLimit(1)
-                                
-                                Text(session.date.formatted(date: .abbreviated, time: .shortened))
-                                    .font(.caption)
-                                    .foregroundColor(.gray)
-                            }
-                            
-                            Spacer()
-                            
-                            if session.id == client.currentSessionId {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .font(.title3)
-                                    .foregroundColor(.blue)
-                            }
+                    if let url = client.downloadedURL {
+                        ShareLink(item: url) {
+                            Image(systemName: "square.and.arrow.down.fill")
+                                .font(.title2).foregroundColor(.green)
+                        }.frame(width: 44)
+                    } else {
+                        Button(action: startBuild) {
+                            if client.isBusy { ProgressView() } else { Image(systemName: "play.fill").font(.title2) }
                         }
-                        .padding(.vertical, 4)
+                        .disabled(client.isBusy)
+                        .frame(width: 44)
                     }
-                    .listRowBackground(Color(white: 0.12))
-                    .listRowSeparatorTint(Color.white.opacity(0.2))
-                }
-                .onDelete(perform: client.deleteSession)
-            }
-            .scrollContentBackground(.hidden)
-            .background(Color(red: 0.08, green: 0.08, blue: 0.1).ignoresSafeArea())
-            .navigationTitle("History")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
-        }
-        .preferredColorScheme(.dark)
-    }
-}
-
-struct ChatBubble: View {
-    let message: ChatMessage
-    var body: some View {
-        HStack(alignment: .bottom) {
-            if message.isUser { Spacer() }
-            
-            VStack(alignment: message.isUser ? .trailing : .leading) {
-                Text(message.text)
-                    .padding(14)
-                    .background(message.isUser ? Color.blue : Color(white: 0.2))
-                    .foregroundColor(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    .frame(maxWidth: UIScreen.main.bounds.width * 0.75, alignment: message.isUser ? .trailing : .leading)
-                    .fixedSize(horizontal: false, vertical: true)
+                }.padding()
                 
-                Text(message.date.formatted(.dateTime.hour().minute()))
-                    .font(.caption2).foregroundColor(.gray).padding(.horizontal, 4)
+                Divider()
+                
+                TextEditor(text: $codeText)
+                    .font(.custom("Menlo", size: 12))
+                    .padding(4)
             }
-            if !message.isUser { Spacer() }
+            .navigationTitle("Cloud Compiler 2.1")
+            .toolbar { Button(action: { showSettings = true }) { Image(systemName: "gear") } }
+            .sheet(isPresented: $showSettings) {
+                Form {
+                    Section("GitHub Auth") {
+                        TextField("User", text: $config.owner)
+                        TextField("Repo", text: $config.repo)
+                        SecureField("Token", text: $config.token)
+                    }
+                    Button("Save") { showSettings = false }
+                }
+            }
+        }
+    }
+    
+    func startBuild() {
+        guard !config.token.isEmpty else { client.statusMessage = "No Token"; return }
+        
+        // 1. Generate Project.yml dynamically
+        // Note: Removed 'xcodeVersion: 15.0' so it uses the latest version (16) on the new server
+        let projectYml = """
+        name: \(appName)
+        options:
+          bundleIdPrefix: neo.uniwalls
+        targets:
+          \(appName):
+            type: application
+            platform: iOS
+            deploymentTarget: 17.0
+            sources: [\(config.codePath)]
+            settings:
+              base:
+                PRODUCT_BUNDLE_IDENTIFIER: neo.uniwalls
+                DEVELOPMENT_TEAM: VYB7C529CN
+                CODE_SIGN_STYLE: Manual
+                CODE_SIGN_IDENTITY: "Apple Development"
+                PROVISIONING_PROFILE_SPECIFIER: "Developer"
+                GENERATE_INFOPLIST_FILE: YES
+                MARKETING_VERSION: 1.0
+                CURRENT_PROJECT_VERSION: 1
+                INFOPLIST_KEY_UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+                INFOPLIST_KEY_UILaunchScreen_Generation: true
+        """
+        
+        Task {
+            do {
+                client.statusMessage = "Uploading Project Spec..."
+                try await client.uploadFile(content: projectYml, path: config.projectPath, config: config)
+                
+                client.statusMessage = "Uploading Source Code..."
+                try await client.uploadFile(content: codeText, path: config.codePath, config: config)
+                
+                try await client.triggerBuild(config: config)
+                try await client.monitorAndDownload(config: config)
+            } catch {
+                if case let GitHubClient.APIError.requestFailed(reason) = error {
+                    client.statusMessage = reason
+                } else {
+                    client.statusMessage = "Error: \(error.localizedDescription)"
+                }
+                client.isBusy = false
+            }
         }
     }
 }

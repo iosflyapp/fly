@@ -1,42 +1,38 @@
 name: Stream to iPad
 
-# Trigger manually from GitHub App or Website
 on: workflow_dispatch
 
 jobs:
   build-and-stream:
-    runs-on: macos-13 # Uses a Mac runner
+    runs-on: macos-latest  # <--- CHANGED THIS LINE
     
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # Updated to v4 for better compatibility
       
       # STEP 1: Build specifically for the Simulator architecture
-      # IMPORTANT: Replace 'YourSchemeName' below with your actual App Name
+      # REMEMBER: Change 'SwiftIDE' below to your actual scheme name if it's different!
       - name: Build for Simulator
         run: |
           xcodebuild build \
             -scheme "SwiftIDE" \
             -sdk iphonesimulator \
-            -destination 'platform=iOS Simulator,name=iPhone 14' \
+            -destination 'platform=iOS Simulator,name=iPhone 15' \
             -configuration Debug \
             -derivedDataPath build
             
-      # STEP 2: Zip the App Bundle (Appetize needs a .zip file)
+      # STEP 2: Zip the App Bundle
       - name: Zip the Build
         run: |
-          # Go into the build folder where Xcode put the app
           cd build/Build/Products/Debug-iphonesimulator/
-          
-          # Zip it up. The *.app selects whatever your app is named.
           zip -r app_build.zip *.app
           
       # STEP 3: Upload to Appetize.io
       - name: Upload to Streaming Server
         id: upload_step
         run: |
-          # We use curl to send the zip file to Appetize
-          # We capture the result in a variable called 'response'
+          # The -F "file=@..." flag sends the zip file
+          # The response captures the JSON output from Appetize
           response=$(curl --request POST https://api.appetize.io/v1/apps \
             --header "Authorization: Basic ${{ secrets.APPETIZE_TOKEN }}" \
             --header 'Content-Type: application/json' \
@@ -44,9 +40,8 @@ jobs:
             -F "file=@build/Build/Products/Debug-iphonesimulator/app_build.zip")
             
           echo "Upload complete!"
-          echo "Response from Server: $response"
           
-          # This prints the public key you need for your iPad App
+          # This helps you find the key in the logs
           echo "------------------------------------------------"
           echo "LOOK BELOW FOR YOUR PUBLIC KEY:"
           echo $response | grep -o '"publicKey":"[^"]*"'

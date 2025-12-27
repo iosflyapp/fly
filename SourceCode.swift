@@ -134,7 +134,6 @@ class GitHubClient: ObservableObject {
         req.httpMethod = method
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        // User-Agent is required by GitHub API
         req.setValue("iosflyapp", forHTTPHeaderField: "User-Agent")
         return req
     }
@@ -186,7 +185,7 @@ struct ContentView: View {
                     .font(.custom("Menlo", size: 12))
                     .padding(4)
             }
-            .navigationTitle("Cloud Compiler 2.0")
+            .navigationTitle("Cloud Compiler 2.1")
             .toolbar { Button(action: { showSettings = true }) { Image(systemName: "gear") } }
             .sheet(isPresented: $showSettings) {
                 Form {
@@ -205,12 +204,11 @@ struct ContentView: View {
         guard !config.token.isEmpty else { client.statusMessage = "No Token"; return }
         
         // 1. Generate Project.yml dynamically
-        // FIX: Added xcodeVersion: "15.0" below to force compatibility with GitHub Runners
+        // Note: Removed 'xcodeVersion: 15.0' so it uses the latest version (16) on the new server
         let projectYml = """
         name: \(appName)
         options:
           bundleIdPrefix: neo.uniwalls
-          xcodeVersion: 15.0
         targets:
           \(appName):
             type: application

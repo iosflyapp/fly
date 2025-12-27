@@ -1,40 +1,53 @@
-name: Build and Stream
+name: Stream to iPad
 
-on: workflow_dispatch  # Allows you to trigger it manually
+# Trigger manually from GitHub App or Website
+on: workflow_dispatch
 
 jobs:
   build-and-stream:
     runs-on: macos-13 # Uses a Mac runner
     
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v3
       
-      # 1. Build the App for the SIMULATOR
+      # STEP 1: Build specifically for the Simulator architecture
+      # IMPORTANT: Replace 'YourSchemeName' below with your actual App Name
       - name: Build for Simulator
         run: |
           xcodebuild build \
-            -scheme "YourAppScheme" \
+            -scheme "YourSchemeName" \
             -sdk iphonesimulator \
             -destination 'platform=iOS Simulator,name=iPhone 14' \
             -configuration Debug \
             -derivedDataPath build
             
-      # 2. Zip the .app bundle (Appetize requires a zip)
+      # STEP 2: Zip the App Bundle (Appetize needs a .zip file)
       - name: Zip the Build
         run: |
+          # Go into the build folder where Xcode put the app
           cd build/Build/Products/Debug-iphonesimulator/
-          zip -r app_build.zip YourAppName.app
           
-      # 3. Upload to Appetize.io
+          # Zip it up. The *.app selects whatever your app is named.
+          zip -r app_build.zip *.app
+          
+      # STEP 3: Upload to Appetize.io
       - name: Upload to Streaming Server
         id: upload_step
         run: |
-          response=$(curl --request POST https://api.appetize.io/v1/apps/your_public_key_if_updating_existing \
+          # We use curl to send the zip file to Appetize
+          # We capture the result in a variable called 'response'
+          response=$(curl --request POST https://api.appetize.io/v1/apps \
             --header "Authorization: Basic ${{ secrets.APPETIZE_TOKEN }}" \
             --header 'Content-Type: application/json' \
-            --data-raw '{ "url": "DIRECT_UPLOAD", "platform": "ios" }' \
+            --data-raw '{ "platform": "ios", "fileType": "zip" }' \
             -F "file=@build/Build/Products/Debug-iphonesimulator/app_build.zip")
             
-          # Extract the Public Key URL from the JSON response
-          # (In a real script, you would parse the JSON properly to get the 'publicKeys')
-          echo "App uploaded! View it here: https://appetize.io/app/YOUR_PUBLIC_KEY"
+          echo "Upload complete!"
+          echo "Response from Server: $response"
+          
+          # This prints the public key you need for your iPad App
+          echo "------------------------------------------------"
+          echo "LOOK BELOW FOR YOUR PUBLIC KEY:"
+          echo $response | grep -o '"publicKey":"[^"]*"'
+          echo "------------------------------------------------"

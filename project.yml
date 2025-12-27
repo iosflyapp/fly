@@ -1,0 +1,18 @@
+name: ProReader
+options:
+  bundleIdPrefix: com.yourname # Change this to match your provisioning profile!
+targets:
+  ProReader:
+    type: application
+    platform: iOS
+    deploymentTarget: 17.0
+    sources: [ProReaderApp.swift]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codius # MUST MATCH YOUR PROVISIONING PROFILE
+        DEVELOPMENT_TEAM: VYB7C529CN # Find this in your Apple Developer Account (e.g., 7A45XX...)
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: “Apple Development Program” # Or “Apple Distribution” if using a distro cert
+        PROVISIONING_PROFILE_SPECIFIER: “Developer” # The actual name inside the .mobileprovision file
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        INFOPLIST_KEY_UILaunchScreen_Generation: true

@@ -8,19 +8,49 @@ on:
         required: true
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: macos-latest
+    
     steps:
       - uses: actions/checkout@v4
       
-      - name: Build App
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.2.app
+      
+      - name: Create Xcode Project
         run: |
-          echo "Building ${{ github.event.inputs.file_name }}"
-          # Add your build commands here
+          mkdir -p MyApp/MyApp
+          cp Sources/${{ github.event.inputs.file_name }} MyApp/MyApp/ContentView.swift
+          
+          # Create minimal app structure
+          cat > MyApp/MyApp/MyAppApp.swift << 'EOF'
+          import SwiftUI
+          @main
+          struct MyAppApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                  }
+              }
+          }
+          EOF
+          
+          # Create project.pbxproj (this is simplified - you'd need a template)
+          
+      - name: Build for Simulator
+        run: |
+          cd MyApp
+          xcodebuild -scheme MyApp -sdk iphonesimulator -configuration Debug -derivedDataPath build
           
       - name: Upload to Appetize
-        env:
-          APPETIZE_TOKEN: ${{ secrets.APPETIZE_TOKEN }}
         run: |
-          # Upload to Appetize.io
-          echo "Uploading to Appetize"
+          APP_PATH=$(find build -name "*.app" -type d | head -1)
+          zip -r app.zip "$APP_PATH"
+          
+          curl -X POST \
+            --http1.1 \
+            -H "Authorization: ${{ secrets.APPETIZE_TOKEN }}" \
+            -F "file=@app.zip" \
+            -F "platform=ios" \
+            -F "publicKey=zvc4brtsspoktczlbrs54s3mhi" \
+            https://api.appetize.io/v2/apps

@@ -23,24 +23,57 @@ jobs:
           mkdir -p MyApp/Sources/Assets.xcassets/AppIcon.appiconset
           mkdir -p MyApp/Sources/Assets.xcassets/AccentColor.colorset
           
-          # Process uploaded file
+          # Show original file
+          echo "=== Original uploaded file ==="
+          cat "Sources/${{ github.event.inputs.file_name }}" || echo "File not found"
+          echo ""
+          echo "================================"
+          
+          # Simple approach: Use sed to remove @main and the App struct
           if [ -f "Sources/${{ github.event.inputs.file_name }}" ]; then
-            cat "Sources/${{ github.event.inputs.file_name }}" | awk '
-              /@main/ { skip=1; next }
-              /struct [A-Za-z]+App.*:.*App/ { skip=1; brace=1; next }
-              skip && /{/ { brace++ }
-              skip && /}/ { brace--; if(brace<=0) { skip=0 }; next }
-              !skip { print }
-            ' > MyApp/Sources/ContentView.swift
+            # Copy the file first
+            cp "Sources/${{ github.event.inputs.file_name }}" MyApp/Sources/temp.swift
             
-            echo "=== ContentView.swift ==="
+            # Remove @main line
+            sed -i '' '/@main/d' MyApp/Sources/temp.swift
+            
+            # Remove the App struct (MyApp, SwiftIDEApp, etc.) - multiline removal with perl
+            perl -i -p0e 's/struct\s+\w+App\s*:\s*App\s*\{[^}]*\{[^}]*\}[^}]*\}//gs' MyApp/Sources/temp.swift
+            
+            # Also try simpler pattern for single-line or simple App structs
+            perl -i -p0e 's/struct\s+\w+App\s*:\s*App\s*\{[^}]*\}//gs' MyApp/Sources/temp.swift
+            
+            # Remove any empty lines at the start
+            sed -i '' '/^$/N;/^\n$/d' MyApp/Sources/temp.swift
+            
+            # Move to final location
+            mv MyApp/Sources/temp.swift MyApp/Sources/ContentView.swift
+            
+            echo "=== Processed ContentView.swift ==="
             cat MyApp/Sources/ContentView.swift
+            echo ""
+            echo "================================"
           else
             cat > MyApp/Sources/ContentView.swift << 'SWIFT'
           import SwiftUI
+          
           struct ContentView: View {
               var body: some View {
                   Text("Hello World")
+              }
+          }
+          SWIFT
+          fi
+          
+          # Verify ContentView struct exists
+          if ! grep -q "struct ContentView" MyApp/Sources/ContentView.swift; then
+            echo "ERROR: ContentView not found! Creating default..."
+            cat > MyApp/Sources/ContentView.swift << 'SWIFT'
+          import SwiftUI
+          
+          struct ContentView: View {
+              var body: some View {
+                  Text("Hello World - Default")
               }
           }
           SWIFT
@@ -95,20 +128,23 @@ jobs:
                   ASSETCATALOG_COMPILER_APPICON_NAME: ""
                   ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: "NO"
                   ONLY_ACTIVE_ARCH: "NO"
-                  ARCHS: "x86_64 arm64"
-                  VALID_ARCHS: "x86_64 arm64"
           YAML
+          
+          echo "=== Final MyAppApp.swift ==="
+          cat MyApp/Sources/MyAppApp.swift
+          echo ""
+          echo "=== All source files ==="
+          ls -la MyApp/Sources/
 
       - name: Generate Xcode Project
         run: |
           cd MyApp
           xcodegen generate
 
-      - name: Build for Simulator (Universal)
+      - name: Build for Simulator
         run: |
           cd MyApp
           
-          # Build for x86_64 (Intel Macs / Appetize)
           xcodebuild \
             -project MyApp.xcodeproj \
             -scheme MyApp \
@@ -121,7 +157,14 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             ASSETCATALOG_COMPILER_APPICON_NAME="" \
             ONLY_ACTIVE_ARCH=NO \
-            build
+            build 2>&1 | tee build.log
+          
+          # Check for build errors
+          if grep -q "error:" build.log; then
+            echo "=== BUILD ERRORS ==="
+            grep "error:" build.log
+            exit 1
+          fi
           
           echo "Build complete!"
           find build -name "*.app" -type d
@@ -134,11 +177,9 @@ jobs:
           echo "=== App contents ==="
           ls -la "$APP_PATH"
           
-          echo "=== Binary architecture ==="
+          echo "=== Binary info ==="
           file "$APP_PATH/MyApp"
-          
-          echo "=== Info.plist ==="
-          cat "$APP_PATH/Info.plist"
+          lipo -info "$APP_PATH/MyApp"
 
       - name: Upload to Appetize
         env:
@@ -151,7 +192,6 @@ jobs:
             exit 1
           fi
           
-          # Zip the entire .app bundle correctly
           cd "$(dirname "$APP_PATH")"
           zip -r app.zip "$(basename "$APP_PATH")"
           

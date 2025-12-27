@@ -13,7 +13,7 @@ jobs:
       # STEP 1: Build for Simulator
       - name: Build for Simulator
         run: |
-          # Find the directory containing the project file
+          # Find the project directory
           PROJECT_PATH=$(find . -name "*.xcodeproj" -o -name "Package.swift" | head -n 1 | xargs dirname)
           
           if [ -z "$PROJECT_PATH" ]; then
@@ -23,7 +23,7 @@ jobs:
           
           cd "$PROJECT_PATH"
 
-          # Build the Scheme "SwiftIDE"
+          # Build the Scheme "SwiftIDE" for iPhone 16
           xcodebuild build \
             -scheme "SwiftIDE" \
             -sdk iphonesimulator \
@@ -31,31 +31,24 @@ jobs:
             -configuration Debug \
             -derivedDataPath build
 
-      # STEP 2: Package and Zip (NEW FIX)
+      # STEP 2: Package and Zip
       - name: Package and Zip
         run: |
-          # 1. Find the raw executable binary (It won't be a .app folder yet)
-          # We look in the build folder for a file named "SwiftIDE"
+          # Find the raw executable
           BINARY_PATH=$(find build/Build/Products/Debug-iphonesimulator -maxdepth 1 -type f -name "SwiftIDE" | head -n 1)
           
           if [ -z "$BINARY_PATH" ]; then
              echo "❌ ERROR: Could not find raw executable 'SwiftIDE'"
-             # Debug info if it fails
-             ls -R build/Build/Products/Debug-iphonesimulator
              exit 1
           fi
 
-          echo "✅ Found binary at: $BINARY_PATH"
-          
-          # 2. Manually create the .app Folder Structure
+          # Create .app structure
           APP_NAME="SwiftIDE"
           APP_DIR="$APP_NAME.app"
           mkdir -p "$APP_DIR"
-          
-          # 3. Move the Binary into the .app folder
           cp "$BINARY_PATH" "$APP_DIR/$APP_NAME"
           
-          # 4. Create a minimal Info.plist (Required for iOS to launch it)
+          # Create Info.plist
           cat > "$APP_DIR/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -79,23 +72,22 @@ jobs:
           </plist>
           EOF
           
-          echo "📦 Created bundle: $APP_DIR"
-
-          # 5. Zip it for Appetize
+          # Zip it
           zip -r app_build.zip "$APP_DIR"
-          
-          # Move to workspace root so next step finds it
           mv app_build.zip $GITHUB_WORKSPACE/app_build.zip
 
-      # STEP 3: Upload to Appetize
+      # STEP 3: Upload to Appetize (FIXED)
       - name: Upload to Streaming Server
         id: upload_step
         run: |
-          response=$(curl --request POST https://api.appetize.io/v1/apps \
-            --header "Authorization: Basic ${{ secrets.APPETIZE_TOKEN }}" \
-            --header 'Content-Type: application/json' \
-            --data-raw '{ "platform": "ios", "fileType": "zip" }' \
-            -F "file=@app_build.zip")
+          # We removed the conflicting --data-raw command.
+          # We now use -F (Form Data) for everything, which is what Appetize expects for files.
+          
+          response=$(curl -s https://api.appetize.io/v1/apps \
+            -H "Authorization: Basic ${{ secrets.APPETIZE_TOKEN }}" \
+            -F "file=@app_build.zip" \
+            -F "platform=ios" \
+            -F "fileType=zip")
             
           echo "Upload complete!"
           echo "------------------------------------------------"

@@ -1,8 +1,8 @@
-name: U
+name: S
 options:
   bundleIdPrefix: neo.uniwalls
 targets:
-  U:
+  S:
     type: application
     platform: iOS
     deploymentTarget: 17.0

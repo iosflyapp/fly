@@ -20,10 +20,10 @@ jobs:
       - name: Build Archive
         run: |
           xcodebuild archive \
-            -project U.xcodeproj \
-            -scheme U \
+            -project S.xcodeproj \
+            -scheme S \
             -destination "generic/platform=iOS" \
-            -archivePath build/U.xcarchive \
+            -archivePath build/S.xcarchive \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
@@ -31,14 +31,14 @@ jobs:
       - name: Export IPA (Unsigned)
         run: |
           mkdir -p Payload
-          cp -r build/U.xcarchive/Products/Applications/U.app Payload/
-          zip -r U.ipa Payload
+          cp -r build/S.xcarchive/Products/Applications/S.app Payload/
+          zip -r S.ipa Payload
           
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: build-${{ github.run_id }}
-          files: U.ipa
+          files: S.ipa
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
